@@ -2,21 +2,9 @@
 const nextConfig = {
   experimental: {
     serverComponentsExternalPackages: [
-      'fluent-ffmpeg',
-      'sharp',
+      'edge-tts-universal',
       'googleapis',
     ],
-  },
-
-  webpack: (config, { isServer }) => {
-    if (isServer) {
-      config.externals = [
-        ...(Array.isArray(config.externals) ? config.externals : []),
-        'fluent-ffmpeg',
-        'sharp',
-      ];
-    }
-    return config;
   },
 };
 

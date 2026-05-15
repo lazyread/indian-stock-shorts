@@ -44,7 +44,7 @@ export async function POST(req: NextRequest) {
         height:       1344,
         width:        768,
         samples:      1,
-        steps:        20,
+        steps:        8,   // 20 → 8: keeps Netlify free-tier under 10s timeout
         style_preset: 'photographic',
       },
       {
@@ -53,7 +53,7 @@ export async function POST(req: NextRequest) {
           Accept:         'application/json',
           Authorization:  `Bearer ${apiKey}`,
         },
-        timeout: 24000,
+        timeout: 9000,   // hard cap under Netlify's 10s free-tier limit
       }
     );
 

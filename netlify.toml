@@ -7,6 +7,12 @@
 
 [functions]
   node_bundler = "nft"
+  # Explicitly bundle TTS module so nft tracer doesn't miss it
+  included_files = [
+    "node_modules/edge-tts-universal/**",
+    "node_modules/ws/**",
+    "node_modules/node-fetch/**"
+  ]
 
 [build.environment]
   NODE_VERSION = "20"

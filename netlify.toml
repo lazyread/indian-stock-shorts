@@ -7,7 +7,6 @@
 
 [functions]
   node_bundler = "nft"
-  included_files = ["node_modules/ws/**"]
 
 [build.environment]
   NODE_VERSION = "20"

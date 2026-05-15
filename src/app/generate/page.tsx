@@ -356,13 +356,16 @@ export default function GeneratePage() {
             headers: { 'Content-Type': 'application/json' },
             body:    JSON.stringify({ prompt: scene.imagePrompt, index: idx }),
           });
-          if (!res.ok) throw new Error(`Image ${idx + 1} failed: ${res.status}`);
+          if (!res.ok) {
+            const errData = await res.json().catch(() => ({})) as { error?: string };
+            throw new Error(errData.error || `HTTP ${res.status}`);
+          }
           const data = await res.json() as { base64: string; index: number };
           imageBase64s[data.index] = data.base64;
           addLog(`  ✓ Scene ${idx + 1} image done`);
         } catch (err) {
-          addLog(`  ✗ Scene ${idx + 1} image failed — using black frame`);
-          console.error(err);
+          const reason = err instanceof Error ? err.message : String(err);
+          addLog(`  ✗ Scene ${idx + 1} failed: ${reason}`);
         }
       });
 
@@ -378,11 +381,11 @@ export default function GeneratePage() {
       const voiceRes = await fetch('/api/generate/voice', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ text: script.fullScript, voice }),
+        body:    JSON.stringify({ text: String(script.fullScript), voice }),
       });
       if (!voiceRes.ok) {
-        const err = await voiceRes.json().catch(() => ({}));
-        throw new Error(err.error || `Voice API failed (${voiceRes.status})`);
+        const errData = await voiceRes.json().catch(() => ({})) as { error?: string };
+        throw new Error(errData.error || `Voice API failed (${voiceRes.status})`);
       }
       const { base64: audioBase64 } = await voiceRes.json() as { base64: string };
       updateStep('voice', 'done');

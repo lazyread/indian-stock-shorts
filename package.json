@@ -20,7 +20,8 @@
     "react-dom": "^18",
     "sharp": "^0.33.4",
     "sonner": "^1.5.0",
-    "tailwindcss-animate": "^1.0.7"
+    "tailwindcss-animate": "^1.0.7",
+    "ws": "^8.20.1"
   },
   "devDependencies": {
     "@netlify/plugin-nextjs": "^5.15.11",
@@ -28,6 +29,7 @@
     "@types/node": "^20",
     "@types/react": "^18",
     "@types/react-dom": "^18",
+    "@types/ws": "^8.18.1",
     "concurrently": "^9.2.1",
     "eslint": "^8",
     "eslint-config-next": "14.2.5",

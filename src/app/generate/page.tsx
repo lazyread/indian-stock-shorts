@@ -38,26 +38,26 @@ const TONES = [
   { id: 'URGENT',       label: '⚡ Urgent',       desc: 'Breaking news style' },
 ];
 const INITIAL_STEPS: Omit<PipelineStep, 'status' | 'elapsed'>[] = [
-  { id: 'script', label: 'Generate Script', detail: 'Template engine builds narration from stock data' },
-  { id: 'images', label: 'Generate Images', detail: 'Pollinations AI — Flux model, 6 scenes, browser-side' },
-  { id: 'voice',  label: 'Generate Voice',  detail: 'Microsoft Edge TTS via browser WebSocket' },
-  { id: 'render', label: 'Render Video',    detail: 'Canvas API — Ken Burns, subtitles, MediaRecorder' },
+  { id: 'script', label: 'Generate Script', detail: 'Template engine builds narration' },
+  { id: 'images', label: 'Generate Images', detail: 'Pollinations.ai Turbo — 6 scenes, sequential' },
+  { id: 'voice',  label: 'Generate Voice',  detail: 'Google TTS via edge proxy (silent fallback if blocked)' },
+  { id: 'render', label: 'Render Video',    detail: 'Canvas — Ken Burns, subtitles, MediaRecorder' },
 ];
 function initSteps(): PipelineStep[] {
   return INITIAL_STEPS.map(s => ({ ...s, status: 'pending', elapsed: null }));
 }
 
-// ── Browser-side image generation (Pollinations.ai) ────────────
-async function generateImageBrowser(prompt: string, idx: number): Promise<string | null> {
+// ── Browser-side image (Pollinations.ai turbo, sequential) ─────
+async function fetchImage(prompt: string, idx: number): Promise<string> {
   const enhanced =
-    `${prompt}, ultra realistic photorealistic 8k, cinematic lighting, ` +
-    `vertical portrait 9:16 aspect ratio, Indian financial context, no text, no watermarks`;
+    `${prompt}, photorealistic, cinematic lighting, vertical portrait 9:16, ` +
+    `Indian financial context, no text, no logos, no watermarks`;
   const url =
     `https://image.pollinations.ai/prompt/${encodeURIComponent(enhanced)}` +
-    `?width=768&height=1344&nologo=true&model=flux&seed=${idx * 7 + 42}&enhance=true`;
+    `?width=768&height=1344&nologo=true&model=turbo&seed=${idx * 17 + 3}`;
 
-  const res = await fetch(url, { signal: AbortSignal.timeout(45_000) });
-  if (!res.ok) throw new Error(`Pollinations HTTP ${res.status}`);
+  const res = await fetch(url, { signal: AbortSignal.timeout(40_000) });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
   const blob    = await res.blob();
   const blobUrl = URL.createObjectURL(blob);
@@ -66,106 +66,36 @@ async function generateImageBrowser(prompt: string, idx: number): Promise<string
     const img = new Image();
     img.onload = () => {
       try {
-        const c   = document.createElement('canvas');
-        c.width   = 768; c.height = 1344;
+        const c = document.createElement('canvas');
+        c.width = 768; c.height = 1344;
         c.getContext('2d')!.drawImage(img, 0, 0, 768, 1344);
         URL.revokeObjectURL(blobUrl);
         resolve(c.toDataURL('image/jpeg', 0.88).split(',')[1]);
       } catch (e) { URL.revokeObjectURL(blobUrl); reject(e); }
     };
-    img.onerror = () => { URL.revokeObjectURL(blobUrl); reject(new Error('Image load failed')); };
+    img.onerror = () => { URL.revokeObjectURL(blobUrl); reject(new Error('img load failed')); };
     img.src = blobUrl;
   });
 }
 
-// ── Browser-side voice (Edge TTS WebSocket) ────────────────────
-function escapeXml(s: string) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-          .replace(/"/g,'&quot;').replace(/'/g,'&apos;');
-}
-
-async function generateVoiceBrowser(text: string, voice: string): Promise<ArrayBuffer> {
-  const TOKEN  = '6A5AA1D4EAFF4E9FB37E23D68491D6F4';
-  const connId = crypto.randomUUID().replace(/-/g,'').toUpperCase();
-  const reqId  = crypto.randomUUID().replace(/-/g,'').toUpperCase();
-  const ts     = new Date().toISOString();
-
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(
-      `wss://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1` +
-      `?TrustedClientToken=${TOKEN}&ConnectionId=${connId}`
-    );
-    ws.binaryType = 'arraybuffer';
-
-    const chunks: ArrayBuffer[] = [];
-    let done = false;
-    const timer = setTimeout(() => {
-      done = true; ws.close();
-      reject(new Error('Edge TTS timeout (20s)'));
-    }, 20_000);
-
-    ws.onopen = () => {
-      ws.send(
-        `X-Timestamp:${ts}\r\nContent-Type:application/json; charset=utf-8\r\nPath:speech.config\r\n\r\n` +
-        JSON.stringify({ context: { synthesis: { audio: {
-          metadataoptions: { sentenceBoundaryEnabled: false, wordBoundaryEnabled: false },
-          outputFormat: 'audio-24khz-48kbitrate-mono-mp3',
-        }}}})
-      );
-      const ssml =
-        `<speak version='1.0' xml:lang='en-US'>` +
-        `<voice name='${voice}'><prosody rate='+5%' volume='+10%'>${escapeXml(text)}</prosody></voice>` +
-        `</speak>`;
-      ws.send(
-        `X-RequestId:${reqId}\r\nContent-Type:application/ssml+xml\r\n` +
-        `X-Timestamp:${ts}Z\r\nPath:ssml\r\n\r\n${ssml}`
-      );
-    };
-
-    ws.onmessage = (e: MessageEvent) => {
-      if (typeof e.data === 'string') {
-        if (e.data.includes('Path:turn.end')) {
-          done = true; clearTimeout(timer); ws.close(1000);
-          const total  = chunks.reduce((n, c) => n + c.byteLength, 0);
-          const result = new Uint8Array(total);
-          let off = 0;
-          for (const c of chunks) { result.set(new Uint8Array(c), off); off += c.byteLength; }
-          resolve(result.buffer);
-        }
-      } else if (e.data instanceof ArrayBuffer) {
-        const buf = new Uint8Array(e.data);
-        if (buf.byteLength < 2) return;
-        const hLen   = (buf[0] << 8) | buf[1];
-        const header = new TextDecoder().decode(buf.slice(2, 2 + hLen));
-        if (header.includes('Path:audio')) chunks.push(buf.slice(2 + hLen).buffer as ArrayBuffer);
-      }
-    };
-    ws.onerror  = () => { clearTimeout(timer); if (!done) { done = true; reject(new Error('Edge TTS WebSocket error')); } };
-    ws.onclose  = (e: CloseEvent) => {
-      clearTimeout(timer);
-      if (!done) { done = true; reject(new Error(`Edge TTS closed early (code ${e.code})`)); }
-    };
-  });
-}
-
 // ── Canvas video renderer ──────────────────────────────────────
-const CANVAS_W = 768;
-const CANVAS_H = 1344;
+const W = 768, H = 1344;
 
 function wrapText(ctx: CanvasRenderingContext2D, text: string, maxW: number): string[] {
-  const words = text.split(' ');
-  const lines: string[] = [];
-  let line = '';
+  const words = text.split(' '); const lines: string[] = []; let line = '';
   for (const w of words) {
-    const test = line ? `${line} ${w}` : w;
-    if (ctx.measureText(test).width > maxW && line) { lines.push(line); line = w; }
-    else line = test;
+    const t = line ? `${line} ${w}` : w;
+    if (ctx.measureText(t).width > maxW && line) { lines.push(line); line = w; } else line = t;
   }
-  if (line) lines.push(line);
-  return lines;
+  if (line) lines.push(line); return lines;
 }
 
-async function renderVideoOnCanvas(
+function makeSilentBuffer(seconds: number): AudioBuffer {
+  const ctx = new AudioContext();
+  return ctx.createBuffer(1, Math.ceil(seconds * ctx.sampleRate), ctx.sampleRate);
+}
+
+async function renderVideo(
   scenes: GeneratedScene[],
   images: (HTMLImageElement | null)[],
   audioBuffer: AudioBuffer,
@@ -173,20 +103,14 @@ async function renderVideoOnCanvas(
 ): Promise<Blob> {
   return new Promise((resolve, reject) => {
     const canvas = document.createElement('canvas');
-    canvas.width = CANVAS_W; canvas.height = CANVAS_H;
+    canvas.width = W; canvas.height = H;
     const ctx = canvas.getContext('2d')!;
 
     const audioCtx  = new AudioContext();
-    const srcNode   = audioCtx.createBufferSource();
-    srcNode.buffer  = audioBuffer;
+    const src       = audioCtx.createBufferSource();
+    src.buffer      = audioBuffer;
     const audioDest = audioCtx.createMediaStreamDestination();
-    srcNode.connect(audioDest);
-
-    const videoStream    = canvas.captureStream(30);
-    const combinedStream = new MediaStream([
-      ...videoStream.getVideoTracks(),
-      ...audioDest.stream.getAudioTracks(),
-    ]);
+    src.connect(audioDest);
 
     const mimeType = [
       'video/webm;codecs=vp9,opus',
@@ -194,77 +118,67 @@ async function renderVideoOnCanvas(
       'video/webm',
     ].find(m => MediaRecorder.isTypeSupported(m)) ?? '';
 
-    const recorder = new MediaRecorder(combinedStream, mimeType ? { mimeType } : {});
+    const stream   = new MediaStream([
+      ...canvas.captureStream(30).getVideoTracks(),
+      ...audioDest.stream.getAudioTracks(),
+    ]);
+    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
     const chunks: Blob[] = [];
     recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
     recorder.onstop  = () => { audioCtx.close(); resolve(new Blob(chunks, { type: mimeType || 'video/webm' })); };
     recorder.onerror = e  => { audioCtx.close(); reject(e); };
 
-    const totalDur  = audioBuffer.duration;
-    const sceneDur  = totalDur / scenes.length;
-    let startTime: number | null = null;
-    let lastPct = 0;
+    const total  = audioBuffer.duration;
+    const perScene = total / scenes.length;
+    let t0: number | null = null; let lastPct = 0;
 
     function drawFrame(now: number) {
-      if (startTime === null) startTime = now;
-      const elapsed = (now - startTime) / 1000;
-      if (elapsed >= totalDur) {
+      if (t0 === null) t0 = now;
+      const elapsed = (now - t0) / 1000;
+      if (elapsed >= total) {
         drawScene(ctx, scenes[scenes.length - 1], images[scenes.length - 1], 1);
-        recorder.stop(); srcNode.stop(); onProgress(100);
-        return;
+        recorder.stop(); src.stop(); onProgress(100); return;
       }
-      const pct = Math.min(100, Math.round((elapsed / totalDur) * 100));
+      const pct = Math.min(100, Math.round((elapsed / total) * 100));
       if (pct > lastPct) { lastPct = pct; onProgress(pct); }
-      const si = Math.min(Math.floor(elapsed / sceneDur), scenes.length - 1);
-      drawScene(ctx, scenes[si], images[si], (elapsed - si * sceneDur) / sceneDur);
+      const si = Math.min(Math.floor(elapsed / perScene), scenes.length - 1);
+      drawScene(ctx, scenes[si], images[si], (elapsed - si * perScene) / perScene);
       requestAnimationFrame(drawFrame);
     }
 
-    function drawScene(
-      ctx: CanvasRenderingContext2D,
-      scene: GeneratedScene,
-      img: HTMLImageElement | null,
-      t: number,
-    ) {
-      ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    function drawScene(ctx: CanvasRenderingContext2D, scene: GeneratedScene, img: HTMLImageElement | null, t: number) {
+      ctx.clearRect(0, 0, W, H);
       if (img) {
-        const zoom = 1 + t * 0.08;
-        const panX = (scene.sceneNumber % 2 === 0 ? 1 : -1) * t * 20;
-        const sw = CANVAS_W * zoom; const sh = CANVAS_H * zoom;
-        ctx.drawImage(img, (CANVAS_W - sw) / 2 + panX, (CANVAS_H - sh) / 2 + t * -15, sw, sh);
+        const z = 1 + t * 0.08;
+        const px = (scene.sceneNumber % 2 === 0 ? 1 : -1) * t * 20;
+        ctx.drawImage(img, (W - W * z) / 2 + px, (H - H * z) / 2 - t * 15, W * z, H * z);
       } else {
-        ctx.fillStyle = '#08090e'; ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+        ctx.fillStyle = '#08090e'; ctx.fillRect(0, 0, W, H);
       }
-      const grad = ctx.createLinearGradient(0, CANVAS_H * 0.6, 0, CANVAS_H);
-      grad.addColorStop(0, 'rgba(0,0,0,0)'); grad.addColorStop(1, 'rgba(0,0,0,0.85)');
-      ctx.fillStyle = grad; ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
-      ctx.font = 'bold 44px "Segoe UI", Arial, sans-serif';
-      ctx.textAlign = 'center';
-      const lines = wrapText(ctx, scene.subtitleText, CANVAS_W - 80);
-      const lineH = 56;
-      const baseY = CANVAS_H - 120 - lines.length * lineH;
-      ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 12;
-      ctx.fillStyle = '#FFFFFF';
-      lines.forEach((l, i) => ctx.fillText(l, CANVAS_W / 2, baseY + i * lineH));
+      const g = ctx.createLinearGradient(0, H * 0.6, 0, H);
+      g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.85)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+      ctx.font = 'bold 44px "Segoe UI",Arial,sans-serif'; ctx.textAlign = 'center';
+      const lines = wrapText(ctx, scene.subtitleText, W - 80);
+      const baseY  = H - 120 - lines.length * 56;
+      ctx.shadowColor = 'rgba(0,0,0,0.9)'; ctx.shadowBlur = 12; ctx.fillStyle = '#fff';
+      lines.forEach((l, i) => ctx.fillText(l, W / 2, baseY + i * 56));
       ctx.shadowBlur = 0;
-      const dotW = 6; const gap = 10;
-      const totalW = scenes.length * (dotW + gap) - gap;
-      const startX = (CANVAS_W - totalW) / 2;
+      const dotW = 6, gap = 10, totalDotW = scenes.length * (dotW + gap) - gap;
+      const sx = (W - totalDotW) / 2;
       for (let i = 0; i < scenes.length; i++) {
         ctx.beginPath();
-        ctx.arc(startX + i * (dotW + gap) + dotW / 2, CANVAS_H - 40, dotW / 2, 0, Math.PI * 2);
-        ctx.fillStyle = i === scene.sceneNumber - 1 ? '#FFFFFF' : 'rgba(255,255,255,0.35)';
+        ctx.arc(sx + i * (dotW + gap) + dotW / 2, H - 40, dotW / 2, 0, Math.PI * 2);
+        ctx.fillStyle = i === scene.sceneNumber - 1 ? '#fff' : 'rgba(255,255,255,0.35)';
         ctx.fill();
       }
     }
 
-    recorder.start(100);
-    srcNode.start(0);
-    requestAnimationFrame(drawFrame);
+    recorder.start(100); src.start(0); requestAnimationFrame(drawFrame);
   });
 }
 
-// ── Spinner ────────────────────────────────────────────────────
+// ── UI helpers ─────────────────────────────────────────────────
 function Spinner() {
   return (
     <svg className="animate-spin w-4 h-4 text-blue-400" fill="none" viewBox="0 0 24 24">
@@ -280,7 +194,7 @@ function StepIcon({ status }: { status: StepStatus }) {
   return <span className="w-4 h-4 rounded-full border border-slate-600 inline-block"/>;
 }
 
-// ── Main Page ──────────────────────────────────────────────────
+// ── Page ───────────────────────────────────────────────────────
 export default function GeneratePage() {
   const [stockName, setStockName] = useState('');
   const [ticker,    setTicker]    = useState('');
@@ -299,13 +213,11 @@ export default function GeneratePage() {
   const [seoData,   setSeoData]   = useState<GeneratedSEO | null>(null);
   const [videoBlob, setVideoBlob] = useState<Blob | null>(null);
 
-  const addLog = useCallback((msg: string) => {
-    setLogs(prev => [...prev.slice(-80), msg]);
-  }, []);
+  const addLog = useCallback((msg: string) => setLogs(p => [...p.slice(-80), msg]), []);
 
-  const updateStep = useCallback((id: string, status: StepStatus) => {
+  const setStep = useCallback((id: string, status: StepStatus) => {
     const now = Date.now();
-    setSteps(prev => prev.map(s => {
+    setSteps(p => p.map(s => {
       if (s.id !== id) return s;
       const elapsed = status === 'done' && stepTimes.current[id] ? now - stepTimes.current[id] : s.elapsed;
       return { ...s, status, elapsed };
@@ -322,59 +234,84 @@ export default function GeneratePage() {
     stepTimes.current = {};
 
     try {
-      // ── 1. Script (server) ────────────────────────────────
-      updateStep('script', 'active');
-      addLog('Generating script and scenes…');
-      const scriptRes = await fetch('/api/generate/script', {
+      // ── 1. Script ─────────────────────────────────────────
+      setStep('script', 'active');
+      addLog('Generating script…');
+      const sRes = await fetch('/api/generate/script', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stockName, ticker, stockInfo, price, tone }),
       });
-      if (!scriptRes.ok) {
-        const err = await scriptRes.json().catch(() => ({})) as { error?: string };
-        throw new Error(err.error || `Script API failed (${scriptRes.status})`);
+      if (!sRes.ok) {
+        const e = await sRes.json().catch(() => ({})) as { error?: string };
+        throw new Error(e.error || `Script failed (${sRes.status})`);
       }
-      const { script, scenes, seo } = await scriptRes.json() as {
-        script: { fullScript: string };
+      const { script, scenes, seo } = await sRes.json() as {
+        script: { fullScript: string; estimatedDuration: number };
         scenes: GeneratedScene[];
         seo:    GeneratedSEO;
       };
       setSeoData(seo);
-      updateStep('script', 'done');
-      addLog(`Script ready — ${scenes.length} scenes, ${script.fullScript.split(' ').length} words`);
+      setStep('script', 'done');
+      addLog(`Script ready — ${scenes.length} scenes, ${script.fullScript.split(' ').length} words (~${script.estimatedDuration}s)`);
 
-      // ── 2. Images (browser → Pollinations.ai, parallel) ──
-      updateStep('images', 'active');
-      addLog(`Generating ${scenes.length} images via Pollinations.ai…`);
+      // ── 2. Images (sequential, turbo model) ───────────────
+      setStep('images', 'active');
+      addLog(`Generating ${scenes.length} images (Pollinations turbo)…`);
       const imageBase64s: (string | null)[] = new Array(scenes.length).fill(null);
-      await Promise.all(scenes.map(async (scene, idx) => {
-        try {
-          addLog(`  Scene ${idx + 1}: ${scene.imagePrompt.slice(0, 55)}…`);
-          imageBase64s[idx] = await generateImageBrowser(scene.imagePrompt, idx);
-          addLog(`  ✓ Scene ${idx + 1} done`);
-        } catch (err) {
-          addLog(`  ✗ Scene ${idx + 1} failed: ${err instanceof Error ? err.message : String(err)}`);
-        }
-      }));
-      updateStep('images', 'done');
-      addLog(`Images done — ${imageBase64s.filter(Boolean).length}/${scenes.length} successful`);
 
-      // ── 3. Voice (browser → Edge TTS WebSocket) ───────────
-      updateStep('voice', 'active');
-      addLog('Generating voice via Edge TTS (browser)…');
-      const audioArrayBuffer = await generateVoiceBrowser(script.fullScript, voice);
-      const tempCtx   = new AudioContext();
-      const audioBuffer = await tempCtx.decodeAudioData(audioArrayBuffer.slice(0));
-      await tempCtx.close();
-      updateStep('voice', 'done');
-      addLog(`Voice ready — ${audioBuffer.duration.toFixed(1)}s`);
+      for (let i = 0; i < scenes.length; i++) {
+        try {
+          addLog(`  [${i + 1}/${scenes.length}] ${scenes[i].imagePrompt.slice(0, 50)}…`);
+          imageBase64s[i] = await fetchImage(scenes[i].imagePrompt, i);
+          addLog(`  ✓ Scene ${i + 1} done`);
+        } catch (err) {
+          addLog(`  ✗ Scene ${i + 1}: ${err instanceof Error ? err.message : 'failed'}`);
+        }
+        // Brief pause between requests to avoid rate-limiting
+        if (i < scenes.length - 1) await new Promise(r => setTimeout(r, 400));
+      }
+
+      setStep('images', 'done');
+      addLog(`Images: ${imageBase64s.filter(Boolean).length}/${scenes.length} OK`);
+
+      // ── 3. Voice (server edge proxy → silent fallback) ────
+      setStep('voice', 'active');
+      addLog('Generating voice via edge TTS proxy…');
+      let audioBuffer: AudioBuffer;
+
+      try {
+        const vRes = await fetch('/api/generate/voice', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: script.fullScript, voice }),
+        });
+        if (!vRes.ok) {
+          const e = await vRes.json().catch(() => ({})) as { error?: string };
+          throw new Error(e.error || `Voice failed (${vRes.status})`);
+        }
+        const { base64 } = await vRes.json() as { base64: string };
+        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
+        const tmp   = new AudioContext();
+        audioBuffer = await tmp.decodeAudioData(bytes.buffer.slice(0));
+        await tmp.close();
+        setStep('voice', 'done');
+        addLog(`Voice ready — ${audioBuffer.duration.toFixed(1)}s`);
+      } catch (voiceErr) {
+        // Always fall through — generate a silent video rather than failing entirely
+        const msg = voiceErr instanceof Error ? voiceErr.message : 'unknown';
+        addLog(`⚠ Voice unavailable (${msg}) — rendering with subtitles only`);
+        audioBuffer = makeSilentBuffer(script.estimatedDuration || 40);
+        setStep('voice', 'done');
+        addLog(`Using ${audioBuffer.duration.toFixed(0)}s silent track`);
+      }
 
       // ── 4. Render ─────────────────────────────────────────
-      updateStep('render', 'active');
+      setStep('render', 'active');
       setStage('rendering');
       addLog('Rendering video on canvas…');
 
-      const imgElements: (HTMLImageElement | null)[] = await Promise.all(
+      const imgEls: (HTMLImageElement | null)[] = await Promise.all(
         imageBase64s.map(b64 => {
           if (!b64) return Promise.resolve(null);
           return new Promise<HTMLImageElement | null>(res => {
@@ -386,15 +323,15 @@ export default function GeneratePage() {
         })
       );
 
-      const blob = await renderVideoOnCanvas(scenes, imgElements, audioBuffer, pct => {
+      const blob = await renderVideo(scenes, imgEls, audioBuffer, pct => {
         setRenderPct(pct);
         if (pct % 25 === 0) addLog(`  Render ${pct}%`);
       });
 
       const url = URL.createObjectURL(blob);
       setVideoBlob(blob); setVideoUrl(url);
-      updateStep('render', 'done');
-      addLog(`Video ready — ${(blob.size / 1024 / 1024).toFixed(1)} MB`);
+      setStep('render', 'done');
+      addLog(`Done — ${(blob.size / 1024 / 1024).toFixed(1)} MB`);
       setStage('done');
       toast.success('Video ready!');
 
@@ -402,10 +339,10 @@ export default function GeneratePage() {
       const msg = err instanceof Error ? err.message : String(err);
       addLog(`ERROR: ${msg}`);
       setStage('error');
-      setSteps(prev => prev.map(s => s.status === 'active' ? { ...s, status: 'error' } : s));
+      setSteps(p => p.map(s => s.status === 'active' ? { ...s, status: 'error' } : s));
       toast.error(msg);
     }
-  }, [stockName, ticker, stockInfo, price, tone, voice, updateStep, addLog]);
+  }, [stockName, ticker, stockInfo, price, tone, voice, setStep, addLog]);
 
   const isRunning = stage === 'generating' || stage === 'rendering';
 
@@ -420,14 +357,12 @@ export default function GeneratePage() {
       </header>
 
       <main className="max-w-6xl mx-auto px-6 py-10 grid grid-cols-1 lg:grid-cols-2 gap-8">
-
         {/* ── Form ─────────────────────────────────────────── */}
         <section className="space-y-6">
           <div>
             <h1 className="text-2xl font-bold text-white">Generate Stock Short</h1>
-            <p className="text-slate-400 text-sm mt-1">Images and voice generated entirely in your browser — no API keys needed.</p>
+            <p className="text-slate-400 text-sm mt-1">Video renders in your browser. No API keys required.</p>
           </div>
-
           <form onSubmit={handleSubmit} className="space-y-5">
             <div className="grid grid-cols-2 gap-4">
               <div>
@@ -438,32 +373,28 @@ export default function GeneratePage() {
               </div>
               <div>
                 <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wide">Ticker</label>
-                <input value={ticker} onChange={e => setTicker(e.target.value)} placeholder="e.g. RELIANCE"
-                  disabled={isRunning}
+                <input value={ticker} onChange={e => setTicker(e.target.value)} placeholder="e.g. RELIANCE" disabled={isRunning}
                   className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 transition"/>
               </div>
             </div>
-
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wide">Stock Info & Analysis *</label>
               <textarea value={stockInfo} onChange={e => setStockInfo(e.target.value)}
-                placeholder="Paste key metrics, recent news, earnings, sector trends…"
+                placeholder="Paste key metrics, news, earnings, sector trends…"
                 rows={5} required disabled={isRunning}
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 resize-none transition"/>
             </div>
-
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wide">Current Price (₹)</label>
               <input value={price} onChange={e => setPrice(e.target.value)} placeholder="e.g. 2840" disabled={isRunning}
                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50 transition"/>
             </div>
-
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-2 uppercase tracking-wide">Video Tone</label>
               <div className="grid grid-cols-5 gap-2">
                 {TONES.map(t => (
                   <button key={t.id} type="button" disabled={isRunning} onClick={() => setTone(t.id)} title={t.desc}
-                    className={`rounded-lg py-2.5 px-1 text-center transition-all text-xs font-medium border ${
+                    className={`rounded-lg py-2.5 px-1 text-center text-xs font-medium border transition-all ${
                       tone === t.id ? 'bg-blue-600 border-blue-500 text-white shadow-lg shadow-blue-900/30'
                                     : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'
                     } disabled:opacity-50`}>
@@ -473,7 +404,6 @@ export default function GeneratePage() {
                 ))}
               </div>
             </div>
-
             <div>
               <label className="block text-xs font-medium text-slate-400 mb-1.5 uppercase tracking-wide">Narrator Voice</label>
               <select value={voice} onChange={e => setVoice(e.target.value)} disabled={isRunning}
@@ -481,17 +411,16 @@ export default function GeneratePage() {
                 {VOICES.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
               </select>
             </div>
-
             <button type="submit" disabled={isRunning}
-              className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-xl py-3.5 flex items-center justify-center gap-2 transition-all shadow-lg shadow-blue-900/30 text-sm">
-              {isRunning ? (
-                <><Spinner />{stage === 'rendering' ? `Rendering… ${renderPct}%` : 'Generating…'}</>
-              ) : (
-                <><svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/>
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                  </svg>Generate Video</>
-              )}
+              className="w-full bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-xl py-3.5 flex items-center justify-center gap-2 transition-all shadow-lg text-sm">
+              {isRunning
+                ? <><Spinner/>{stage === 'rendering' ? `Rendering… ${renderPct}%` : 'Generating…'}</>
+                : <>
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"/>
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                    </svg>Generate Video
+                  </>}
             </button>
           </form>
         </section>
@@ -514,7 +443,7 @@ export default function GeneratePage() {
                         step.status === 'active' ? 'text-blue-300' :
                         step.status === 'done'   ? 'text-emerald-300' :
                         step.status === 'error'  ? 'text-red-300' : 'text-slate-400'}`}>{step.label}</span>
-                      {step.elapsed != null && <span className="text-xs text-slate-500 flex-shrink-0">{(step.elapsed/1000).toFixed(1)}s</span>}
+                      {step.elapsed != null && <span className="text-xs text-slate-500">{(step.elapsed/1000).toFixed(1)}s</span>}
                     </div>
                     <p className="text-xs text-slate-500 mt-0.5">{step.detail}</p>
                     {step.id === 'render' && step.status === 'active' && (
@@ -537,9 +466,12 @@ export default function GeneratePage() {
                 <div className={`w-2 h-2 rounded-full ${isRunning ? 'bg-green-500 animate-pulse' : 'bg-slate-600'}`}/>
                 <span className="text-xs text-slate-500 font-mono uppercase tracking-wider">Live Log</span>
               </div>
-              <div className="p-4 max-h-48 overflow-y-auto space-y-1 font-mono text-xs text-slate-400">
+              <div className="p-4 max-h-56 overflow-y-auto space-y-1 font-mono text-xs text-slate-400">
                 {logs.map((l, i) => (
-                  <div key={i} className={l.startsWith('ERROR') ? 'text-red-400' : l.startsWith('  ✓') ? 'text-emerald-400' : undefined}>{l}</div>
+                  <div key={i} className={
+                    l.startsWith('ERROR') ? 'text-red-400' :
+                    l.startsWith('⚠')    ? 'text-yellow-400' :
+                    l.includes('✓')      ? 'text-emerald-400' : undefined}>{l}</div>
                 ))}
               </div>
             </div>
@@ -556,7 +488,7 @@ export default function GeneratePage() {
               </div>
               <div className="p-4 flex flex-col gap-3">
                 {videoBlob && (
-                  <a href={videoUrl} download={`${stockName.replace(/\s+/g,'-')}-${tone.toLowerCase()}-short.webm`}
+                  <a href={videoUrl} download={`${stockName.replace(/\s+/g,'-')}-${tone.toLowerCase()}.webm`}
                     className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-medium rounded-xl py-3 text-sm text-center transition-colors flex items-center justify-center gap-2">
                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/>
@@ -581,15 +513,13 @@ export default function GeneratePage() {
           )}
 
           {stage === 'error' && (
-            <div className="bg-red-950/30 border border-red-900/50 rounded-xl p-5">
-              <div className="flex gap-3 items-start">
-                <span className="text-red-400 text-xl">✗</span>
-                <div>
-                  <p className="text-red-300 font-medium">Generation failed</p>
-                  <p className="text-red-400/70 text-sm mt-1">Check the live log above for details.</p>
-                  <button onClick={() => { setStage('idle'); setSteps(initSteps()); setLogs([]); }}
-                    className="mt-3 text-sm text-red-300 hover:text-white underline">Try again</button>
-                </div>
+            <div className="bg-red-950/30 border border-red-900/50 rounded-xl p-5 flex gap-3 items-start">
+              <span className="text-red-400 text-xl">✗</span>
+              <div>
+                <p className="text-red-300 font-medium">Generation failed</p>
+                <p className="text-red-400/70 text-sm mt-1">Check the live log above.</p>
+                <button onClick={() => { setStage('idle'); setSteps(initSteps()); setLogs([]); }}
+                  className="mt-3 text-sm text-red-300 hover:text-white underline">Try again</button>
               </div>
             </div>
           )}
@@ -597,8 +527,8 @@ export default function GeneratePage() {
           {stage === 'idle' && (
             <div className="bg-slate-900/50 border border-slate-800/50 border-dashed rounded-2xl p-10 text-center text-slate-600">
               <div className="text-4xl mb-3">🎬</div>
-              <p className="text-sm">Fill in the form and hit <span className="text-slate-400 font-medium">Generate Video</span></p>
-              <p className="text-xs mt-2 text-slate-700">Images via Pollinations.ai · Voice via Edge TTS · Rendered in browser</p>
+              <p className="text-sm text-slate-500">Fill the form and hit <strong className="text-slate-400">Generate Video</strong></p>
+              <p className="text-xs mt-2">Images via Pollinations.ai · Voice via Google TTS · Rendered in browser</p>
             </div>
           )}
         </section>

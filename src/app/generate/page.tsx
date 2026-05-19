@@ -290,7 +290,24 @@ async function renderVideo(
 
   // ── Main promise ───────────────────────────────────────────
   return new Promise<Blob>((resolve, reject) => {
-    const recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    // MediaRecorder constructor can throw NotSupportedError even when
+    // isTypeSupported() returns true (hardware codec constraints on some
+    // devices). Fall back to no-options default if the explicit mimeType
+    // is rejected — the browser will pick a supported container itself.
+    let recorder: MediaRecorder;
+    try {
+      recorder = new MediaRecorder(stream, mimeType ? { mimeType } : {});
+    } catch {
+      onLog(`⚠ MediaRecorder rejected mimeType "${mimeType}" — falling back to browser default`);
+      try {
+        recorder = new MediaRecorder(stream);
+      } catch (fallbackErr) {
+        audioCtx.close().catch(() => {});
+        videoTrack.stop();
+        reject(new Error(`MediaRecorder unavailable: ${fallbackErr instanceof Error ? fallbackErr.message : fallbackErr}`));
+        return;
+      }
+    }
     const chunks: Blob[] = [];
 
     recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
@@ -403,6 +420,7 @@ export default function GeneratePage() {
   const abortCtrl   = useRef<AbortController | null>(null);
   const runToken    = useRef<RunToken>({ cancelled: false });
   const videoUrlRef = useRef<string | null>(null); // tracks current URL for cleanup
+  const logEndRef   = useRef<HTMLDivElement>(null); // auto-scroll anchor for log panel
 
   // ── Cleanup on unmount ─────────────────────────────────────
   useEffect(() => {
@@ -417,6 +435,11 @@ export default function GeneratePage() {
       }
     };
   }, []);
+
+  // ── Log auto-scroll — keep the latest entry visible ────────
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
 
   const addLog = useCallback((msg: string) =>
     setLogs(p => [...p.slice(-80), `[${new Date().toLocaleTimeString()}] ${msg}`]),
@@ -848,6 +871,8 @@ export default function GeneratePage() {
                     undefined
                   }>{l}</div>
                 ))}
+                {/* Invisible anchor — scrolled into view on every log update */}
+                <div ref={logEndRef} />
               </div>
             </div>
           )}

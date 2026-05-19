@@ -72,8 +72,8 @@ function wrapText(ctx: CanvasRenderingContext2D, text: string, maxW: number): st
 }
 
 // ── Silent audio buffer — uses AudioBuffer constructor (no AudioContext needed)
-// FIX: Previously created a never-closed AudioContext to get sampleRate, hitting
-//      the browser's 6-context limit on repeated runs.
+// Using the constructor avoids creating an AudioContext just to read sampleRate,
+// which previously leaked contexts and hit the browser's hard limit of 6.
 function makeSilentBuffer(seconds: number): AudioBuffer {
   const sampleRate = 48000;
   return new AudioBuffer({
@@ -81,6 +81,44 @@ function makeSilentBuffer(seconds: number): AudioBuffer {
     length: Math.max(1, Math.ceil(seconds * sampleRate)),
     sampleRate,
   });
+}
+
+// ── Decode Google TTS base64 response into an AudioBuffer ─────
+// Isolated so the temporary AudioContext used for decoding is always closed,
+// and errors surface with a precise message rather than a generic catch.
+async function decodeAudioBase64(base64: string): Promise<AudioBuffer> {
+  if (!base64) throw new Error('TTS base64 payload is empty');
+
+  // atob → binary string → Uint8Array
+  let binaryStr: string;
+  try {
+    binaryStr = atob(base64);
+  } catch {
+    throw new Error(`base64 decode failed — payload may be truncated (length: ${base64.length})`);
+  }
+
+  const bytes = new Uint8Array(binaryStr.length);
+  for (let i = 0; i < binaryStr.length; i++) {
+    bytes[i] = binaryStr.charCodeAt(i);
+  }
+
+  if (bytes.byteLength === 0) throw new Error('Decoded audio is 0 bytes');
+
+  // Use a fresh temporary AudioContext for decoding only.
+  // We close it immediately after decoding — the decoded AudioBuffer is
+  // then transferable to the render AudioContext.
+  const tmp = new AudioContext();
+  try {
+    // .slice(0) creates a detached copy so decodeAudioData can take ownership
+    // of the ArrayBuffer without a "detached" error.
+    const buffer = await tmp.decodeAudioData(bytes.buffer.slice(0));
+    if (!buffer || buffer.duration <= 0) {
+      throw new Error(`Audio decoded but duration is ${buffer?.duration ?? 0}s — likely empty/corrupt`);
+    }
+    return buffer;
+  } finally {
+    await tmp.close().catch(() => {});
+  }
 }
 
 // ── Pollinations image fetch (browser-side) ────────────────────
@@ -133,20 +171,28 @@ async function fetchImage(
 }
 
 // ── Canvas video renderer ──────────────────────────────────────
-// FIX 1: await audioCtx.resume() — AudioContexts created after async hops are
-//         auto-suspended by the browser. A suspended context produces silence
-//         regardless of what the AudioBufferSourceNode plays. This was the
-//         primary cause of no-audio renders.
-// FIX 2: try/catch around src.stop() — calling stop() on a source that has
-//         already finished naturally throws InvalidStateError, freezing the UI.
-// FIX 3: Honour the RunToken.cancelled flag so the caller can abort mid-render.
-// FIX 4: Track rafId on the token so cancelAnimationFrame can be called externally.
+// Audio pipeline notes (failure points addressed here):
+//
+// [A] AudioContext suspend: contexts created mid-async-chain start SUSPENDED.
+//     We explicitly resume() and VERIFY the state. A still-suspended context
+//     captures silence — we log a hard warning so it's visible in the log.
+//
+// [B] src.stop() InvalidStateError: calling stop() on an already-finished
+//     source throws. Wrapped in try/catch everywhere.
+//
+// [C] audioTrack readyState: we check the track is 'live' before recording.
+//
+// [D] RunToken cancellation checked on every RAF frame.
+//
+// [E] All cleanup (audioCtx.close, videoTrack.stop) happens in both resolve
+//     and reject paths so no resources leak on error.
 async function renderVideo(
-  scenes:     GeneratedScene[],
-  images:     (HTMLImageElement | null)[],
+  scenes:      GeneratedScene[],
+  images:      (HTMLImageElement | null)[],
   audioBuffer: AudioBuffer,
-  onProgress: (pct: number) => void,
-  token:      RunToken,
+  onProgress:  (pct: number) => void,
+  onLog:       (msg: string) => void,
+  token:       RunToken,
 ): Promise<Blob> {
   const canvas = document.createElement('canvas');
   canvas.width = W; canvas.height = H;
@@ -155,12 +201,24 @@ async function renderVideo(
   // ── Audio setup ────────────────────────────────────────────
   const audioCtx = new AudioContext();
 
-  // CRITICAL: Resume the context. AudioContexts created mid-async-chain start
-  // suspended. Without this, audioDest.stream produces silence.
-  try { await audioCtx.resume(); } catch { /* best-effort; non-fatal */ }
+  // [A] Resume the context. Must happen before any node is connected to a
+  // MediaStreamDestination — a suspended context produces silent tracks.
+  try {
+    await audioCtx.resume();
+  } catch (resumeErr) {
+    onLog(`⚠ audioCtx.resume() threw: ${resumeErr instanceof Error ? resumeErr.message : resumeErr}`);
+  }
 
-  const src      = audioCtx.createBufferSource();
-  src.buffer     = audioBuffer;
+  if (audioCtx.state !== 'running') {
+    // Log loudly but continue — on some browsers the context starts running
+    // automatically once audio data flows, even without explicit resume().
+    onLog(`⚠ AudioContext state after resume(): "${audioCtx.state}" (expected "running") — audio may be silent`);
+  } else {
+    onLog(`  AudioContext running at ${audioCtx.sampleRate} Hz`);
+  }
+
+  const src       = audioCtx.createBufferSource();
+  src.buffer      = audioBuffer;
   const audioDest = audioCtx.createMediaStreamDestination();
   src.connect(audioDest);
 
@@ -175,7 +233,15 @@ async function renderVideo(
   const videoTrack   = videoStream.getVideoTracks()[0];
   const audioTrack   = audioDest.stream.getAudioTracks()[0];
 
-  if (!audioTrack) throw new Error('Browser produced no audio track from AudioContext');
+  // [C] Verify the audio track exists and is live before we hand it to
+  // MediaRecorder. A dead/missing track silently produces no audio.
+  if (!audioTrack) {
+    audioCtx.close().catch(() => {});
+    throw new Error('AudioContext produced no audio track — browser may not support MediaStreamDestination');
+  }
+  if (audioTrack.readyState !== 'live') {
+    onLog(`⚠ Audio track readyState is "${audioTrack.readyState}" — expected "live"`);
+  }
 
   const stream = new MediaStream([videoTrack, audioTrack]);
 
@@ -459,47 +525,85 @@ export default function GeneratePage() {
       addLog('Requesting TTS via edge proxy…');
       const t0Voice = Date.now();
       let audioBuffer: AudioBuffer;
-      let voiceOk = false;
+      // 'full' = all chunks OK  |  'partial' = some chunks failed but we got audio
+      // 'silent' = complete failure, using synthesised silence
+      let voiceQuality: 'full' | 'partial' | 'silent' = 'silent';
 
       try {
         if (token.cancelled) throw new Error('Cancelled');
+
+        // Wire BOTH the run-level abort signal AND a hard 35s timeout.
+        // 35s is enough for the Netlify edge function (25s budget + network)
+        // but won't leave the user stuck for 90s on a hung request.
+        const voiceSignal = AbortSignal.any
+          ? AbortSignal.any([ac.signal, AbortSignal.timeout(35_000)])
+          : AbortSignal.timeout(35_000);
 
         const vRes = await fetch('/api/generate/voice', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ text: script.fullScript, voice }),
-          // Hard timeout: edge function retries add up; 90s is generous but bounded.
-          signal: AbortSignal.timeout(90_000),
+          signal:  voiceSignal,
         });
 
+        // Parse the JSON body regardless of status so we can log details.
+        let body: {
+          base64?:        string;
+          error?:         string;
+          partial?:       boolean;
+          ok?:            number;
+          failed?:        number;
+          chunks?:        number;
+          bytes?:         number;
+          elapsed?:       number;
+          failureDetails?: string[];
+        } = {};
+        try { body = await vRes.json(); } catch { /* non-json body on 504 etc. */ }
+
         if (!vRes.ok) {
-          const e = await vRes.json().catch(() => ({})) as { error?: string };
-          throw new Error(e.error ?? `TTS API ${vRes.status}`);
+          // Server returned an error. Log details and fall through to silent.
+          const reason = body.error ?? `HTTP ${vRes.status}`;
+          const details = body.failureDetails?.join('; ') ?? '';
+          throw new Error(`TTS API ${vRes.status}: ${reason}${details ? ` (${details})` : ''}`);
         }
 
-        const { base64 } = await vRes.json() as { base64: string };
-        if (!base64) throw new Error('TTS returned empty audio data');
-
-        // Decode: detach via .slice(0) so decodeAudioData can take ownership.
-        const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-        const tmp   = new AudioContext();
-        try {
-          audioBuffer = await tmp.decodeAudioData(bytes.buffer.slice(0));
-          voiceOk = true;
-        } finally {
-          await tmp.close().catch(() => {});
+        if (!body.base64) {
+          throw new Error(`TTS returned no audio data (ok=${body.ok}, failed=${body.failed})`);
         }
 
-        setStep('voice', 'done');
-        addLog(`Voice ready — ${audioBuffer.duration.toFixed(1)}s in ${((Date.now() - t0Voice) / 1000).toFixed(1)}s`);
+        // Log what the server managed to produce.
+        addLog(
+          `  TTS: ${body.ok ?? '?'}/${body.chunks ?? '?'} chunks OK` +
+          `${body.bytes ? `, ${(body.bytes / 1024).toFixed(0)} KB` : ''}` +
+          `${body.partial ? ' (partial — some chunks failed)' : ''}` +
+          `${body.elapsed ? `, server ${body.elapsed}ms` : ''}`
+        );
+        if (body.failureDetails?.length) {
+          body.failureDetails.forEach(d => addLog(`  ⚠ ${d}`));
+        }
+
+        // Decode the MP3 payload into an AudioBuffer.
+        audioBuffer = await decodeAudioBase64(body.base64);
+
+        voiceQuality = body.partial ? 'partial' : 'full';
+        setStep('voice', body.partial ? 'warn' : 'done');
+        addLog(
+          `Voice ready — ${audioBuffer.duration.toFixed(1)}s` +
+          ` | ${audioBuffer.sampleRate} Hz` +
+          ` | ${audioBuffer.numberOfChannels} ch` +
+          ` | ${((Date.now() - t0Voice) / 1000).toFixed(1)}s total` +
+          (body.partial ? ' ⚠ partial audio' : '')
+        );
 
       } catch (voiceErr) {
         if (token.cancelled || ac.signal.aborted) throw new Error('Cancelled');
         const msg = voiceErr instanceof Error ? voiceErr.message : String(voiceErr);
-        addLog(`⚠ TTS failed (${msg})`);
-        addLog(`  → Falling back to silent audio — video will have subtitles only`);
-        // Synthesise a silent buffer matching the estimated script duration.
-        audioBuffer = makeSilentBuffer(script.estimatedDuration || 45);
+        addLog(`⚠ Voice generation failed: ${msg}`);
+        addLog('  → Using silent audio track — video will have subtitles only');
+        addLog('  → Tip: check browser console for additional details');
+        // Silent fallback sized to script duration so render timing is correct.
+        audioBuffer    = makeSilentBuffer(script.estimatedDuration || 45);
+        voiceQuality   = 'silent';
         setStep('voice', 'warn');
         addLog(`  Silent track: ${audioBuffer.duration.toFixed(0)}s`);
       }
@@ -523,7 +627,8 @@ export default function GeneratePage() {
       setStage('rendering');
       const t0Render = Date.now();
       addLog(`Rendering ${audioBuffer.duration.toFixed(1)}s video on canvas…`);
-      if (!voiceOk) addLog('  (subtitles only — no audio)');
+      if (voiceQuality === 'silent')  addLog('  ⚠ No audio — subtitles only');
+      if (voiceQuality === 'partial') addLog('  ⚠ Partial audio — some narration may be cut');
       addLog('  Keep this tab active — background tabs throttle rendering');
 
       const blob = await renderVideo(
@@ -534,6 +639,7 @@ export default function GeneratePage() {
           setRenderPct(pct);
           if (pct > 0 && pct % 20 === 0) addLog(`  Render ${pct}%…`);
         },
+        addLog,
         token,
       );
 
@@ -549,7 +655,12 @@ export default function GeneratePage() {
       setStep('render', 'done');
       addLog(`✓ Done — ${(blob.size / 1024 / 1024).toFixed(1)} MB in ${((Date.now() - t0Render) / 1000).toFixed(1)}s`);
       setStage('done');
-      toast.success(voiceOk ? 'Video ready!' : 'Video ready (subtitles only — TTS unavailable)');
+
+      const toastMsg =
+        voiceQuality === 'full'    ? 'Video ready with full audio!' :
+        voiceQuality === 'partial' ? 'Video ready — partial audio (some TTS chunks failed)' :
+        'Video ready — no audio (TTS failed, subtitles only)';
+      toast.success(toastMsg);
 
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);

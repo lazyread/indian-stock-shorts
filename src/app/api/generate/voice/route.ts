@@ -18,7 +18,7 @@ const LANG_MAP: Record<string, string> = {
 // ── Timing budget ─────────────────────────────────────────────
 // Netlify Edge wall-clock limit: 30 s.
 // We keep 5 s of margin for cold-start + JSON serialisation.
-const EDGE_BUDGET_MS  = 25_000;
+const EDGE_BUDGET_MS   = 25_000;
 // Per-chunk timeout.  No retry on timeout — timing out costs the same
 // time budget as a second attempt, so we skip and preserve the budget.
 const CHUNK_TIMEOUT_MS = 6_000;
@@ -26,11 +26,33 @@ const CHUNK_TIMEOUT_MS = 6_000;
 const RETRY_DELAY_MS   = 400;
 
 // ── Chunk splitting ───────────────────────────────────────────
-// Raw limit per chunk.  encodeURIComponent triples byte-length for Unicode
-// (Hindi, ₹ …) so we cap raw chars conservatively.
-// 280 chars raw → ~3 chunks for a typical 150-word English script.
-// This keeps total sequential requests ≤ 3–4, well within budget.
-const MAX_CHUNK_CHARS = 280;
+// Google Translate TTS (client=gtx) returns HTTP 400 for text longer than
+// ~200 raw characters.  Cap at 150 to stay safely under that limit even
+// when the text contains multi-byte Unicode (Rs, Hindi, etc.).
+//
+// Budget arithmetic for a typical 150-word (~750 char) script:
+//   750 chars / 150 = ~5 chunks x ~2 s avg = ~10 s  (25 s wall budget)
+const MAX_CHUNK_CHARS = 150;
+
+// Sub-split a sentence that is itself longer than MAX_CHUNK_CHARS.
+// Falls back to word-boundary splitting so no piece exceeds the limit.
+function splitLongSentence(sentence: string): string[] {
+  const words = sentence.split(' ');
+  const parts: string[] = [];
+  let buf = '';
+  for (const w of words) {
+    const candidate = buf ? `${buf} ${w}` : w;
+    if (candidate.length > MAX_CHUNK_CHARS && buf) {
+      parts.push(buf.trim());
+      buf = w;
+    } else {
+      buf = candidate;
+    }
+  }
+  const tail = buf.trim();
+  if (tail) parts.push(tail);
+  return parts.filter(p => p.length > 0);
+}
 
 function splitIntoChunks(text: string): string[] {
   const sentences = text.match(/[^.!?]+[.!?]*\s*/g) ?? [text];
@@ -38,17 +60,23 @@ function splitIntoChunks(text: string): string[] {
   let buf = '';
 
   for (const s of sentences) {
-    if (buf.length + s.length > MAX_CHUNK_CHARS && buf.length > 0) {
-      chunks.push(buf.trim());
-      buf = s;
-    } else {
-      buf += s;
+    // A single sentence may itself exceed the limit — sub-split at words.
+    const parts = s.length > MAX_CHUNK_CHARS ? splitLongSentence(s) : [s];
+
+    for (const part of parts) {
+      if (buf.length + part.length > MAX_CHUNK_CHARS && buf.length > 0) {
+        chunks.push(buf.trim());
+        buf = part;
+      } else {
+        buf += part;
+      }
     }
   }
 
   const tail = buf.trim();
   if (tail) {
-    // Merge tiny trailing fragment into last chunk rather than making a new one.
+    // Merge a tiny trailing fragment into the previous chunk to avoid a
+    // one-word extra request at the end.
     if (chunks.length > 0 && tail.length < 30) {
       chunks[chunks.length - 1] += ' ' + tail;
     } else {
@@ -63,9 +91,9 @@ function splitIntoChunks(text: string): string[] {
 // Returns null instead of throwing when the chunk fails so the caller can
 // collect partial results rather than aborting the whole request.
 interface ChunkResult {
-  data:    Uint8Array | null;
-  error:   string | null;
-  ms:      number;
+  data:  Uint8Array | null;
+  error: string | null;
+  ms:    number;
 }
 
 async function fetchChunkSafe(
@@ -112,7 +140,7 @@ async function fetchChunkSafe(
 
       if (!res.ok) {
         lastError = `HTTP ${res.status}`;
-        // On a 429 / 503 it may be worth retrying once; on 4xx others, skip.
+        // On 429 / 503 it may be worth retrying once; on other 4xx, skip.
         if (res.status === 429 || res.status === 503) {
           if (attempt === 1 && (deadlineMs - Date.now()) > RETRY_DELAY_MS + effectiveTimeout) {
             await new Promise(r => setTimeout(r, RETRY_DELAY_MS));
@@ -195,21 +223,21 @@ export async function POST(req: Request) {
       console.log(
         `[voice] chunk ${i + 1}/${chunks.length}` +
         ` (${chunks[i].length} chars)` +
-        ` → ${result.error ?? `${result.data!.byteLength} bytes`}` +
+        ` -> ${result.error ?? `${result.data!.byteLength} bytes`}` +
         ` in ${result.ms}ms | total ${elapsed}ms`
       );
 
       // Hard stop if we are past the deadline regardless of remaining chunks.
       if (Date.now() >= deadline) {
-        console.warn(`[voice] budget exhausted after chunk ${i + 1} — stopping early`);
+        console.warn(`[voice] budget exhausted after chunk ${i + 1} -- stopping early`);
         break;
       }
     }
 
     // ── Categorise results ────────────────────────────────
-    const successful   = results.filter(r => r.data !== null);
-    const failed       = results.filter(r => r.data === null);
-    const failureLog   = failed.map((r, i) => `chunk ${i}: ${r.error}`);
+    const successful = results.filter(r => r.data !== null);
+    const failed     = results.filter(r => r.data === null);
+    const failureLog = failed.map((r, i) => `chunk ${i}: ${r.error}`);
 
     if (successful.length === 0) {
       // All chunks failed — give the client a specific error message.
@@ -217,10 +245,10 @@ export async function POST(req: Request) {
       console.error('[voice] all chunks failed. First error:', reason);
       return Response.json(
         {
-          error:    `Google TTS failed: ${reason}`,
-          details:  failureLog,
-          chunks:   chunks.length,
-          elapsed:  Date.now() - startMs,
+          error:   `Google TTS failed: ${reason}`,
+          details: failureLog,
+          chunks:  chunks.length,
+          elapsed: Date.now() - startMs,
         },
         { status: 500 }
       );
@@ -228,7 +256,7 @@ export async function POST(req: Request) {
 
     // ── Concatenate successful parts ──────────────────────
     // MP3 is a frame-stream format — concatenated frames decode correctly
-    // because each frame has independent sync markers (0xFF 0xFB…).
+    // because each frame has independent sync markers (0xFF 0xFB...).
     const totalBytes = successful.reduce((n, r) => n + r.data!.byteLength, 0);
     const merged     = new Uint8Array(totalBytes);
     let off = 0;
@@ -237,20 +265,20 @@ export async function POST(req: Request) {
     const partial = failed.length > 0;
 
     console.log(
-      `[voice] done — ${successful.length}/${results.length} chunks OK` +
+      `[voice] done -- ${successful.length}/${results.length} chunks OK` +
       ` | ${totalBytes} bytes | partial=${partial}` +
       ` | elapsed=${Date.now() - startMs}ms`
     );
 
     return Response.json({
-      base64:   toBase64(merged),
-      mimeType: 'audio/mpeg',
-      chunks:   chunks.length,
-      ok:       successful.length,
-      failed:   failed.length,
+      base64:         toBase64(merged),
+      mimeType:       'audio/mpeg',
+      chunks:         chunks.length,
+      ok:             successful.length,
+      failed:         failed.length,
       partial,
-      bytes:    totalBytes,
-      elapsed:  Date.now() - startMs,
+      bytes:          totalBytes,
+      elapsed:        Date.now() - startMs,
       // Surface failure details so the client can log them.
       failureDetails: failureLog.length > 0 ? failureLog : undefined,
     });
